@@ -82,6 +82,8 @@ class GithubScraper:
             List[Dict[str, Any]]: Full JSON returned by API
         """
         full_json: List[Dict[str, Any]] = []
+        if not tasks:
+            return full_json
         done, pending = await asyncio.wait(tasks, return_when="ALL_COMPLETED")
         for task in done:
             try:
@@ -124,7 +126,7 @@ class GithubScraper:
                     break
                 for item in json_page:
                     for key, value in added_fields.items():
-                        item[key] = value
+                        item[key] = value   
                 json_data.extend(json_page)
                 page += 1
         return json_data
