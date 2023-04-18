@@ -93,7 +93,7 @@ class GithubScraper:
                 pass
         return full_json
 
-    async def call_api(self, url: str, **added_fields: str) -> List[Dict[str, Any]]:
+    async def call_api(self, url: str, field_parser = None, **added_fields: str) -> List[Dict[str, Any]]:
         """Load json file using requests.
 
         Makes API calls and returns JSON results.
@@ -106,6 +106,7 @@ class GithubScraper:
         Returns:
             List[Dict[str, Any]]: Github URL loaded as JSON
         """
+        print(callable(field_parser))
         page: int = 1
         json_data: List[Dict[str, Any]] = []
         # Requesting user info doesn't support pagination and returns dict, not list
@@ -126,7 +127,9 @@ class GithubScraper:
                     break
                 for item in json_page:
                     for key, value in added_fields.items():
-                        item[key] = value   
+                        item[key] = value
+                    if callable(field_parser):
+                        field_parser(item)
                 json_data.extend(json_page)
                 page += 1
         return json_data
@@ -176,6 +179,33 @@ class GithubScraper:
             "description",
         ]
         self.generate_csv("org_repositories.csv", self.repos, table_columns)
+
+    async def get_repo_commit_history(self) -> None:
+        """Create list of commits to the organizations' repositories."""
+        json_commits_all = []
+        table_columns: List[str] = [
+            "sha",
+            "committer_name",
+            "committer_email",
+            "commit_date",
+        ]
+        def repo_commit_history_field_parser(item: Dict[str, Any]):
+            item["sha"] = item["sha"]
+            item["committer_name"] = item["commit"]["author"]["name"]
+            item["committer_email"] = item["commit"]["author"]["email"]
+            item["commit_date"] = item["commit"]["author"]["date"]
+
+        tasks: List[asyncio.Task[Any]] = []
+        for org in self.orgs:
+            for repo in self.repos:
+                url = f"https://api.github.com/repos/{org}/{repo['name']}/commits"
+                tasks.append(
+                    asyncio.create_task(
+                        self.call_api(url, field_parser=repo_commit_history_field_parser, organization=org, repository=repo["name"])
+                    )
+                )
+        json_commits_all = await self.load_json(tasks)
+        self.generate_csv("commit_history.csv", json_commits_all, table_columns)
 
     async def get_repo_contributors(self) -> None:
         """Create list of contributors to the organizations' repositories."""
@@ -470,6 +500,13 @@ def parse_args() -> Dict[str, bool]:
         action="store_true",
         dest="create_org_repo_csv",
         help="scrape the organizations' repositories (CSV)",
+    )
+    argparser.add_argument(
+        "--repo_commit_history",
+        "-rch",
+        action="store_true",
+        dest="get_repo_commit_history",
+        help="scrape the commit history of all of the organizations' repositories (CSV)",
     )
     argparser.add_argument(
         "--contributors",
