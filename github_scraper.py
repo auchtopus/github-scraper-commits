@@ -93,7 +93,7 @@ class GithubScraper:
                 pass
         return full_json
 
-    async def call_api(self, url: str, field_parser = None, **added_fields: str) -> List[Dict[str, Any]]:
+    async def call_api(self, url: str, field_parser=None, resp_parser=None, **added_fields: str) -> List[Dict[str, Any]]:
         """Load json file using requests.
 
         Makes API calls and returns JSON results.
@@ -106,7 +106,6 @@ class GithubScraper:
         Returns:
             List[Dict[str, Any]]: Github URL loaded as JSON
         """
-        print(callable(field_parser))
         page: int = 1
         json_data: List[Dict[str, Any]] = []
         # Requesting user info doesn't support pagination and returns dict, not list
@@ -123,14 +122,19 @@ class GithubScraper:
         while True:
             async with self.session.get(f"{url}?per_page=100&page={str(page)}") as resp:
                 json_page: List[Dict[str, Any]] = await resp.json()
+                json_page = resp_parser(json_page)
                 if json_page == []:
                     break
-                for item in json_page:
+                parsed_json_page = []
+                for item in json_page:  # assumes that the return is a list
                     for key, value in added_fields.items():
                         item[key] = value
                     if callable(field_parser):
-                        field_parser(item)
-                json_data.extend(json_page)
+                        parsed_json_page.append(field_parser(item))
+                    else:
+                        parsed_json_page.append(item)
+
+                json_data.extend(parsed_json_page)
                 page += 1
         return json_data
 
@@ -189,11 +193,13 @@ class GithubScraper:
             "committer_email",
             "commit_date",
         ]
+
         def repo_commit_history_field_parser(item: Dict[str, Any]):
             item["sha"] = item["sha"]
             item["committer_name"] = item["commit"]["author"]["name"]
             item["committer_email"] = item["commit"]["author"]["email"]
             item["commit_date"] = item["commit"]["author"]["date"]
+            return item
 
         tasks: List[asyncio.Task[Any]] = []
         for org in self.orgs:
@@ -201,7 +207,8 @@ class GithubScraper:
                 url = f"https://api.github.com/repos/{org}/{repo['name']}/commits"
                 tasks.append(
                     asyncio.create_task(
-                        self.call_api(url, field_parser=repo_commit_history_field_parser, organization=org, repository=repo["name"])
+                        self.call_api(url, field_parser=repo_commit_history_field_parser,
+                                      organization=org, repository=repo["name"])
                     )
                 )
         json_commits_all = await self.load_json(tasks)
@@ -430,6 +437,48 @@ class GithubScraper:
             f"{Path('data', self.data_directory.name, 'membership_network.gexf')}"
         )
 
+    async def find_organizations_for_entity(self, entity=None):
+        """Find the organizations that a user or repository belongs to.
+
+        Queries for organizations that contain the entity name;
+        there does not yet appear to be any better means of analyzing this without 
+
+        Args:
+            entity (str, optional): Name of user or repository. Defaults to None.
+
+        Returns:
+            List[str]: list of organizations affiliated with the entity
+        """
+        if entity is None:
+            return []
+        tasks = []
+        query_url = f"https://api.github.com/search/users?&q={entity}+in%3Aname+type%3Aorg&type=User"
+        print(f"Scraping organizations that contain entity name: {entity}")
+        table_columns: List[str] = [
+            "entity",
+            "organization",
+            "id",
+            "html_url",
+        ]
+
+        def entity_organizations_resp_parser(json_page):
+            return json_page["items"]
+        
+        def entity_organizations_field_parser(response):
+            response["organization"] = response["login"]
+            return response
+        # async with self.session.get(query_url) as response:
+        tasks.append(asyncio.create_task(self.call_api(
+            query_url, 
+            resp_parser = entity_organizations_resp_parser, 
+            field_parser = entity_organizations_field_parser,
+            entity=entity)))
+        #  probably need a new pipeline for this
+
+        json_orgs = await self.load_json(tasks)
+        print(json_orgs)
+        self.generate_csv(f"{entity}_organizations.csv", json_orgs, table_columns)
+
 
 def read_config() -> Tuple[str, str]:
     """Read config file.
@@ -552,6 +601,12 @@ def parse_args() -> Dict[str, bool]:
         dest="generate_memberships_network",
         help="scrape all organizational memberships of org members (GEXF)",
     )
+    argparser.add_argument(
+        "--organizations",
+        "-o",
+        dest="find_organizations_for_entity",
+        help="find all organizations affiliated with a certain entity"
+    )
     args: Dict[str, bool] = vars(argparser.parse_args())
     return args
 
@@ -584,7 +639,7 @@ async def main() -> None:
             github_scraper.members = await github_scraper.get_members()
             github_scraper.repos = await github_scraper.get_org_repos()
             for arg in args:
-                if arg != "all":
+                if arg != "all" and arg != "find_organizations_for_entity":
                     await getattr(github_scraper, arg)()
         else:
             # Check args provided, get members/repos if necessary, call related methods
@@ -594,7 +649,10 @@ async def main() -> None:
             if any(arg for arg in called_args if arg in require_repos):
                 github_scraper.repos = await github_scraper.get_org_repos()
             for arg in called_args:
-                await getattr(github_scraper, arg)()
+                if args[arg] is True:
+                    await getattr(github_scraper, arg)()
+                else:
+                     await getattr(github_scraper, arg)(args[arg])
 
 
 if __name__ == "__main__":
