@@ -15,11 +15,16 @@ import networkx as nx
 # TODO: Instead of DiGraph, use MultiDiGraph everywhere?
 
 
+
+
 class GithubScraper:
     """Scrape information about organizational Github accounts.
 
     Use Github API key and user name to make requests to Github API.
     Create spreadsheets named after data type and date.
+
+
+    New Data Schema:
 
     Attributes:
         orgs (List[str]): List of organizational Github accounts to scrape
@@ -27,23 +32,35 @@ class GithubScraper:
     """
 
     def __init__(
-        self, organizations: List[str], session: aiohttp.ClientSession
+        self,  
+        github_session: aiohttp.ClientSession,
+        entities: List[str] = None,
+        organizations: List[str] = None,
+        repos: List[str] = None,
+        members: List[str] = None,
     ) -> None:
         """Instantiate object."""
+        self.github_session = github_session
         self.orgs = organizations
-        self.session = session
+        self.repos = repos # this is asymmetrical! 
+        # # map entities to orgs
+        # self.entities = {entity:None for entity in entities}
+        # # map orgs to repos
+        # self.orgs = {org:None for org in organizations}
+        # # map repos to commits
+        # self.repos = {repo: None for repo in repos}
         # Members and repositories of listed organizations. Instantiated as empty dict
         # and only loaded if user selects operation that needs this list.
         # Saves API calls.
         self.members: Dict[str, List[str]] = {}
-        self.repos: List[Dict[str, Any]] = []
+        self.repo_list: List[Dict[str, Any]] = []
         # Directory to store scraped data with timestamp
         self.data_directory: Path = Path(
             Path.cwd(), "data", time.strftime("%Y-%m-%d_%H-%M-%S")
         )
         Path(self.data_directory).mkdir()
 
-    async def get_members(self) -> Dict[str, List[str]]:
+    async def scrape_members(self) -> Dict[str, List[str]]:
         """Get list of members of specified orgs.
 
         Returns:
@@ -93,7 +110,7 @@ class GithubScraper:
                 pass
         return full_json
 
-    async def call_api(self, url: str, field_parser=None, resp_parser=None, **added_fields: str) -> List[Dict[str, Any]]:
+    async def call_api(self, url: str, field_parser=None, resp_parser=None, callback=None, **added_fields: str) -> List[Dict[str, Any]]:
         """Load json file using requests.
 
         Makes API calls and returns JSON results.
@@ -109,8 +126,8 @@ class GithubScraper:
         page: int = 1
         json_data: List[Dict[str, Any]] = []
         # Requesting user info doesn't support pagination and returns dict, not list
-        if url.split("/")[-2] == "users":
-            async with self.session.get(f"{url}?per_page=100") as resp:
+        if url.split("/")[-2] == "users" or url.split("/")[-3] == "repos":
+            async with self.github_session.get(f"{url}?per_page=100") as resp:
                 member_json: Dict[str, Any] = await resp.json()
                 # if "documentation_url" in member_json:
                 #     sys.exit(member_json['message'])
@@ -120,15 +137,28 @@ class GithubScraper:
             return json_data
         # Other API calls return lists and should paginate
         while True:
-            async with self.session.get(f"{url}?per_page=100&page={str(page)}") as resp:
+            async with self.github_session.get(f"{url}?per_page=100&page={str(page)}") as resp:
                 json_page: List[Dict[str, Any]] = await resp.json()
-                json_page = resp_parser(json_page)
                 if json_page == []:
                     break
+                #  if secondary-rate limited
+                if isinstance(json_page, dict) and "documentation_url" in json_page and "message" in json_page:
+                    if "rate limit exceeded" in json_page["message"]:
+                        await asyncio.sleep(60 * 60)
+                    elif "secondary rate" in json_page["message"]:
+                        await asyncio.sleep(60 * 2)
+                    continue
+                # if not isinstance(json_page, list):
+                #     raise Exception(f"query: {url}?per_page=100&page={str(page)} returned {(type(json_page))}")
+                if callable(resp_parser):
+                    json_page = resp_parser(json_page)
                 parsed_json_page = []
-                for item in json_page:  # assumes that the return is a list
+                for item in json_page:  # assumes that the return is a list of elements
                     for key, value in added_fields.items():
-                        item[key] = value
+                        try:
+                            item[key] = value
+                        except TypeError as e:
+                            print(f"{item=}, \n{key=},\n{json_page=}\n")
                     if callable(field_parser):
                         parsed_json_page.append(field_parser(item))
                     else:
@@ -136,6 +166,8 @@ class GithubScraper:
 
                 json_data.extend(parsed_json_page)
                 page += 1
+        if callable(callback):
+            callback(added_fields, json_data)
         return json_data
 
     def generate_csv(
@@ -158,14 +190,36 @@ class GithubScraper:
                 csv_file.writerow(item)
         print(f"- file saved as {Path('data', self.data_directory.name, file_name)}")
 
-    async def get_org_repos(self) -> List[Dict[str, Any]]:
+    async def scrape_org_repos(self) -> List[Dict[str, Any]]:
         """Create list of the organizations' repositories."""
-        print("Scraping repositories")
+        print("Scraping repositories from orgs")
         tasks: List[asyncio.Task[Any]] = []
-        for org in self.orgs:
-            url = f"https://api.github.com/orgs/{org}/repos"
-            tasks.append(asyncio.create_task(self.call_api(url, organization=org)))
-        return await self.load_json(tasks)
+        if self.orgs:
+            for org in self.orgs:
+                url = f"https://api.github.com/orgs/{org}/repos"
+                tasks.append(asyncio.create_task(self.call_api(url, organization=org)))
+            return await self.load_json(tasks)
+        else:
+            raise ValueError("No organizations to scrape")
+        
+    async def scrape_repos(self) -> List[Dict[str, Any]]:
+        """Create rich repo objects from a tuple list of repos"""
+        print("Completing Repository data")
+        tasks: List[asyncio.Task[Any]] = []
+        if self.repos:
+            for org, repo in self.repos:
+                url = f"https://api.github.com/repos/{org}/{repo}"
+                tasks.append(asyncio.create_task(self.call_api(url, organization=org, repository=repo)))
+            return await self.load_json(tasks)
+        else:
+            raise ValueError("No repositories to scrape")
+        
+
+    async def init_repos(self):
+        if self.repos:
+            return await self.scrape_repos()
+        else:
+            return await self.scrape_org_repos()
 
     async def create_org_repo_csv(self) -> None:
         """Write a CSV file with information about orgs' repositories."""
@@ -182,39 +236,51 @@ class GithubScraper:
             "fork",
             "description",
         ]
-        self.generate_csv("org_repositories.csv", self.repos, table_columns)
+        self.generate_csv("org_repositories.csv", self.repo_list, table_columns)
 
-    async def get_repo_commit_history(self) -> None:
+    async def scrape_repo_commit_history(self) -> None:
         """Create list of commits to the organizations' repositories."""
+        print("Scraping commit history")
         json_commits_all = []
         table_columns: List[str] = [
             "sha",
             "committer_name",
             "committer_email",
-            "commit_date",
+            "commited_at",
+            "repository",
         ]
 
         def repo_commit_history_field_parser(item: Dict[str, Any]):
-            item["sha"] = item["sha"]
-            item["committer_name"] = item["commit"]["author"]["name"]
-            item["committer_email"] = item["commit"]["author"]["email"]
-            item["commit_date"] = item["commit"]["author"]["date"]
+            try:
+                item["sha"] = item["sha"]
+                item["committer_name"] = item["commit"]["author"]["name"]
+                item["committer_email"] = item["commit"]["author"]["email"]
+                item["commited_at"] = item["commit"]["author"]["date"]
+                item["organization"] = item["organization"]
+                item["repository"] = item["repository"]
+            except Exception:
+                print(item)
             return item
 
         tasks: List[asyncio.Task[Any]] = []
-        for org in self.orgs:
-            for repo in self.repos:
-                url = f"https://api.github.com/repos/{org}/{repo['name']}/commits"
-                tasks.append(
-                    asyncio.create_task(
-                        self.call_api(url, field_parser=repo_commit_history_field_parser,
-                                      organization=org, repository=repo["name"])
-                    )
-                )
-        json_commits_all = await self.load_json(tasks)
-        self.generate_csv("commit_history.csv", json_commits_all, table_columns)
 
-    async def get_repo_contributors(self) -> None:
+        def save_commit_callback(metadata, json_data: List[Dict[str, Any]]) -> None:
+            self.generate_csv(f"{metadata['organization']}_{metadata['repository']}_commit_history.csv", json_data, table_columns)
+
+        
+        for repo in self.repo_list:
+            url = f"https://api.github.com/repos/{repo['owner']['login']}/{repo['name']}/commits"
+            tasks.append(
+                asyncio.create_task(
+                    self.call_api(url, field_parser=repo_commit_history_field_parser, callback=save_commit_callback,
+                                    organization=repo['owner']['login'], repository=repo["name"])
+                )
+            )
+        json_commits_all = await self.load_json(tasks)
+        # every repo generats it's own commit history file. Ideal solution is to use a db
+        # self.generate_csv("commit_history.csv", json_commits_all, table_columns)
+
+    async def scrape_repo_contributors(self) -> None:
         """Create list of contributors to the organizations' repositories."""
         print("Scraping contributors")
         json_contributors_all = []
@@ -228,14 +294,13 @@ class GithubScraper:
             "url",
         ]
         tasks: List[asyncio.Task[Any]] = []
-        for org in self.orgs:
-            for repo in self.repos:
-                url = f"https://api.github.com/repos/{org}/{repo['name']}/contributors"
-                tasks.append(
-                    asyncio.create_task(
-                        self.call_api(url, organization=org, repository=repo["name"])
-                    )
+        for repo in self.repo_list:
+            url = f"https://api.github.com/repos/{repo['owner']['login']}/{repo['name']}/contributors"
+            tasks.append(
+                asyncio.create_task(
+                    self.call_api(url, organization={repo['owner']['login']}, repository=repo["name"])
                 )
+            )
         json_contributors_all = await self.load_json(tasks)
         self.generate_csv("contributor_list.csv", json_contributors_all, table_columns)
         for contributor in json_contributors_all:
@@ -253,7 +318,7 @@ class GithubScraper:
             f"{Path('data', self.data_directory.name, 'contributor_network.gexf')}"
         )
 
-    async def get_members_repos(self) -> None:
+    async def scrape_members_repos(self) -> None:
         """Create list of all the members of an organization and their repositories."""
         print("Getting repositories of all members.")
         json_members_repos: List[Dict[str, Any]] = []
@@ -279,7 +344,7 @@ class GithubScraper:
         json_members_repos = await self.load_json(tasks)
         self.generate_csv("members_repositories.csv", json_members_repos, table_columns)
 
-    async def get_members_info(self) -> None:
+    async def scrape_members_info(self) -> None:
         """Gather information about the organizations' members."""
         print("Getting user information of all members.")
         table_columns: List[str] = [
@@ -300,7 +365,7 @@ class GithubScraper:
         json_members_info: List[Dict[str, Any]] = await self.load_json(tasks)
         self.generate_csv("members_info.csv", json_members_info, table_columns)
 
-    async def get_starred_repos(self) -> None:
+    async def scrape_starred_repos(self) -> None:
         """Create list of all the repositories starred by organizations' members."""
         print("Getting repositories starred by members.")
         json_starred_repos_all: List[Dict[str, Any]] = []
@@ -465,7 +530,7 @@ class GithubScraper:
             return json_page["items"]
         
         def entity_organizations_field_parser(response):
-            response["organization"] = response["login"]
+            response["github_org_name"] = response["login"]
             return response
         # async with self.session.get(query_url) as response:
         tasks.append(asyncio.create_task(self.call_api(
@@ -505,14 +570,16 @@ def read_config() -> Tuple[str, str]:
         )
 
 
-def read_organizations() -> List[str]:
+def read_organizations(filename: str = None) -> List[str]:
     """Read list of organizations from file.
 
     Returns:
         List[str]: List of names of organizational Github accounts
     """
     orgs: List[str] = []
-    with open(Path(Path.cwd(), "organizations.csv"), "r", encoding="utf-8") as file:
+    if not filename:
+        filename = "organizations.csv"
+    with open(Path(Path.cwd(), filename), "r", encoding="utf-8") as file:
         reader = csv.DictReader(file)
         for row in reader:
             orgs.append(row["github_org_name"])
@@ -524,6 +591,25 @@ def read_organizations() -> List[str]:
         )
     return orgs
 
+# #  TODO: generalize the caching layer to work with any API call
+def read_repos(filename: str = None) -> List[str]:
+    repos: List[Tuple[str,str]] = []
+    if not filename:
+        filename = "repos.csv"
+    with open(Path(Path.cwd(), filename), "r", encoding="utf-8") as file:
+        reader = csv.DictReader(file)
+        for row in reader:
+            repos.append((row["organization"], row["name"]))
+    if not repos:
+        sys.exit(
+            "No organizations to scrape found in organizations.csv. "
+            "Please add the names of the organizations you want to scrape "
+            "in the column 'github_org_name' (one name per row)."
+        )
+    print(repos)
+    print("REPOS FINISHED")
+    return repos
+    
 
 def parse_args() -> Dict[str, bool]:
     """Parse arguments.
@@ -536,6 +622,16 @@ def parse_args() -> Dict[str, bool]:
     """
     argparser = argparse.ArgumentParser(
         description="Scrape organizational accounts on Github."
+    )
+    argparser.add_argument(
+        "--load-organizations",
+        "-lo",
+        help = "CSV File containing list of organizations to scrape."
+    )
+    argparser.add_argument(
+        "--load-repositories",
+        "-lr", 
+        help=" CSV File containing list of repositories to scrape."
     )
     argparser.add_argument(
         "--all",
@@ -551,38 +647,38 @@ def parse_args() -> Dict[str, bool]:
         help="scrape the organizations' repositories (CSV)",
     )
     argparser.add_argument(
-        "--repo_commit_history",
-        "-rch",
+        "--commit-history",
+        "-ch",
         action="store_true",
-        dest="get_repo_commit_history",
+        dest="scrape_repo_commit_history",
         help="scrape the commit history of all of the organizations' repositories (CSV)",
     )
     argparser.add_argument(
         "--contributors",
         "-c",
         action="store_true",
-        dest="get_repo_contributors",
+        dest="scrape_repo_contributors",
         help="scrape contributors of the organizations' repositories (CSV and GEXF)",
     )
     argparser.add_argument(
         "--member_repos",
         "-mr",
         action="store_true",
-        dest="get_members_repos",
+        dest="scrape_members_repos",
         help="scrape all repositories owned by the members of the organizations (CSV)",
     )
     argparser.add_argument(
         "--member_infos",
         "-mi",
         action="store_true",
-        dest="get_members_info",
+        dest="scrape_members_info",
         help="scrape information about each member of the organizations (CSV)",
     )
     argparser.add_argument(
         "--starred",
         "-s",
         action="store_true",
-        dest="get_starred_repos",
+        dest="scrape_starred_repos",
         help="scrape all repositories starred by members of the organizations (CSV)",
     )
     argparser.add_argument(
@@ -602,8 +698,8 @@ def parse_args() -> Dict[str, bool]:
         help="scrape all organizational memberships of org members (GEXF)",
     )
     argparser.add_argument(
-        "--organizations",
-        "-o",
+        "--entity_organizations",
+        "-eo",
         dest="find_organizations_for_entity",
         help="find all organizations affiliated with a certain entity"
     )
@@ -620,24 +716,34 @@ async def main() -> None:
             "For usage, call: github_scraper -h"
         )
     user, api_token = read_config()
-    organizations = read_organizations()
+
+    
     # To avoid unnecessary API calls, only get org members and repos if needed
     require_members = [
-        "get_members_repos",
-        "get_members_info",
-        "get_starred_repos",
+        "scrape_members_repos",
+        "scrape_members_info",
+        "scrape_starred_repos",
         "generate_follower_network",
         "generate_memberships_network",
     ]
-    require_repos = ["create_org_repo_csv", "get_repo_contributors"]
+    require_repos = ["create_org_repo_csv", "scrape_repo_contributors", "scrape_repo_commit_history"]
     # Start aiohttp session
     auth = aiohttp.BasicAuth(user, api_token)
-    async with aiohttp.ClientSession(auth=auth) as session:
-        github_scraper = GithubScraper(organizations, session)
+    print(args)
+    async with aiohttp.ClientSession(auth=auth) as github_session:
+        if args["load_organizations"]:
+            organizations = read_organizations(args["load_organizations"])
+            github_scraper = GithubScraper(github_session, organizations=organizations)
+        elif args["load_repositories"]:
+            repos = read_repos(args["load_repositories"])
+            github_scraper = GithubScraper(github_session, repos=repos)
+        else:
+            # no file loaded
+            raise Exception("No query file loaded.")
         # If --all was provided, simply run everything
         if args["all"]:
-            github_scraper.members = await github_scraper.get_members()
-            github_scraper.repos = await github_scraper.get_org_repos()
+            github_scraper.members = await github_scraper.scrape_members()
+            github_scraper.repos = await github_scraper.init_repos()
             for arg in args:
                 if arg != "all" and arg != "find_organizations_for_entity":
                     await getattr(github_scraper, arg)()
@@ -645,13 +751,13 @@ async def main() -> None:
             # Check args provided, get members/repos if necessary, call related methods
             called_args = [arg for arg, value in args.items() if value]
             if any(arg for arg in called_args if arg in require_members):
-                github_scraper.members = await github_scraper.get_members()
+                github_scraper.members = await github_scraper.members()
             if any(arg for arg in called_args if arg in require_repos):
-                github_scraper.repos = await github_scraper.get_org_repos()
+                github_scraper.repo_list = await github_scraper.init_repos()
             for arg in called_args:
-                if args[arg] is True:
+                if args[arg] is True and hasattr(github_scraper, arg): # boolean, meaning no argument
                     await getattr(github_scraper, arg)()
-                else:
+                elif args[arg] and  hasattr(github_scraper, arg): # truthy, meaning there's an argument
                      await getattr(github_scraper, arg)(args[arg])
 
 
