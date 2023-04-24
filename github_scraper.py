@@ -18,7 +18,7 @@ import time
 # TODO: Instead of DiGraph, use MultiDiGraph everywhere?
 
 
-past_dir = "/Users/antonsquared/Google_Drive/PLSC_355/github-scraper/data/2023-04-24_00-42-58"
+past_dir = "/Users/antonsquared/Google_Drive/PLSC_355/github-scraper/data/2023-04-24_04-11-31"
 finished_file_list = os.listdir(past_dir)
 finished_repo_set = set()
 for file in finished_file_list:
@@ -27,6 +27,7 @@ for file in finished_file_list:
     repo = file_tokens[1]
     finished_repo_set.add((org, repo))
 print(finished_repo_set)
+print(len(finished_repo_set))
 
 class GithubScraper:
     """Scrape information about organizational Github accounts.
@@ -52,7 +53,7 @@ class GithubScraper:
         self,  
         session_list: List[aiohttp.ClientSession],
         entities: List[str] = None,
-        organizations: List[str] = None,
+        organizations: List[str] = [],
         repos: List[str] = None,
         members: List[str] = None,
     ) -> None:
@@ -62,6 +63,7 @@ class GithubScraper:
         self.num_valid_session = len(session_list)
         self.orgs = organizations
         self.counter = 0
+        self.entities = entities
         self.repos = repos # this is asymmetrical! 
         # # map entities to orgs
         # self.entities = {entity:None for entity in entities}
@@ -232,6 +234,51 @@ class GithubScraper:
                 csv_file.writerow(item)
         print(f"- file saved as {Path('data', self.data_directory.name, file_name)}")
 
+
+    async def find_organizations_for_entity(self, entity=None):
+        """Find the organizations that a user or repository belongs to.
+
+        Queries for organizations that contain the entity name;
+        there does not yet appear to be any better means of analyzing this without 
+
+        Args:
+            entity (str, optional): Name of user or repository. Defaults to None.
+
+        Returns:
+            List[str]: list of organizations affiliated with the entity
+        """
+        if entity is None:
+            return []
+        tasks = []
+        query_url = f"https://api.github.com/search/users?&q={entity}+in%3Aname+type%3Aorg&type=User"
+        print(f"Scraping organizations that contain entity name: {entity}")
+        table_columns: List[str] = [
+            "entity",
+            "github_org_name",
+            "id",
+            "html_url",
+        ]
+
+        def entity_organizations_resp_parser(json_page):
+            return json_page["items"]
+        
+        def entity_organizations_field_parser(response):
+            response["github_org_name"] = response["login"]
+            return response
+        # async with self.session.get(query_url) as response:
+        tasks.append(asyncio.create_task(self.call_api(
+            query_url, 
+            resp_parser = entity_organizations_resp_parser, 
+            field_parser = entity_organizations_field_parser,
+            entity=entity)))
+        #  probably need a new pipeline for this
+
+        json_orgs = await self.load_json(tasks)
+        print(json_orgs)
+        self.generate_csv(f"{entity}_organizations.csv", json_orgs, table_columns)
+        return json_orgs
+
+
     async def scrape_org_repos(self) -> List[Dict[str, Any]]:
         """Create list of the organizations' repositories."""
         print("Scraping repositories from orgs")
@@ -256,9 +303,17 @@ class GithubScraper:
         else:
             raise ValueError("No repositories to scrape")
         
+    async def scrape_entity_orgs(self) -> List[str]:
+        for entity in self.entities:
+            entity_org_list = await self.find_organizations_for_entity(entity)
+            org_names = {org["github_org_name"] for org in entity_org_list}
+            self.orgs.extend(org_names)
 
     async def init_repos(self):
         if not self.repos:
+            if not self.orgs:
+                await self.scrape_entity_orgs()
+                return await self.scrape_org_repos()
             return await self.scrape_org_repos()
         else:
             return await self.scrape_repos()
@@ -278,6 +333,7 @@ class GithubScraper:
             "fork",
             "description",
         ]
+        # no callapi here because it's handled in main as a dependency check
         self.generate_csv("org_repositories.csv", self.repos, table_columns)
 
     async def scrape_repo_commit_history(self) -> None:
@@ -549,48 +605,6 @@ class GithubScraper:
             f"{Path('data', self.data_directory.name, 'membership_network.gexf')}"
         )
 
-    async def find_organizations_for_entity(self, entity=None):
-        """Find the organizations that a user or repository belongs to.
-
-        Queries for organizations that contain the entity name;
-        there does not yet appear to be any better means of analyzing this without 
-
-        Args:
-            entity (str, optional): Name of user or repository. Defaults to None.
-
-        Returns:
-            List[str]: list of organizations affiliated with the entity
-        """
-        if entity is None:
-            return []
-        tasks = []
-        query_url = f"https://api.github.com/search/users?&q={entity}+in%3Aname+type%3Aorg&type=User"
-        print(f"Scraping organizations that contain entity name: {entity}")
-        table_columns: List[str] = [
-            "entity",
-            "github_org_name",
-            "id",
-            "html_url",
-        ]
-
-        def entity_organizations_resp_parser(json_page):
-            return json_page["items"]
-        
-        def entity_organizations_field_parser(response):
-            response["github_org_name"] = response["login"]
-            return response
-        # async with self.session.get(query_url) as response:
-        tasks.append(asyncio.create_task(self.call_api(
-            query_url, 
-            resp_parser = entity_organizations_resp_parser, 
-            field_parser = entity_organizations_field_parser,
-            entity=entity)))
-        #  probably need a new pipeline for this
-
-        json_orgs = await self.load_json(tasks)
-        print(json_orgs)
-        self.generate_csv(f"{entity}_organizations.csv", json_orgs, table_columns)
-
 
 def read_config() -> List[Tuple[str, str]]:
     """Read config file.
@@ -620,6 +634,26 @@ def read_config() -> List[Tuple[str, str]]:
             "Please add them to the config.json file."
         )
 
+def read_entities(filename: str = None) -> List[str]:
+    """Read list of organizations from file.
+
+    Returns:
+        List[str]: List of names of organizational Github accounts
+    """
+    orgs: List[str] = []
+    if not filename:
+        filename = "entities.csv"
+    with open(Path(Path.cwd(), filename), "r", encoding="utf-8") as file:
+        reader = csv.DictReader(file)
+        for row in reader:
+            orgs.append(row["entity_name"])
+    if not orgs:
+        sys.exit(
+            "No organizations to scrape found in organizations.csv. "
+            "Please add the names of the organizations you want to scrape "
+            "in the column 'github_org_name' (one name per row)."
+        )
+    return orgs
 
 def read_organizations(filename: str = None) -> List[str]:
     """Read list of organizations from file.
@@ -689,6 +723,11 @@ def parse_args() -> Dict[str, bool]:
     """
     argparser = argparse.ArgumentParser(
         description="Scrape organizational accounts on Github."
+    )
+    argparser.add_argument(
+        "--load-entities",
+        "-le", 
+        help=" CSV File containing list of entities to scrape."
     )
     argparser.add_argument(
         "--load-organizations",
@@ -801,8 +840,10 @@ async def main() -> None:
         auth = aiohttp.BasicAuth(creds[0], creds[1])
         session_list.append(aiohttp.ClientSession(auth=auth))
     print(args)
-
-    if args["load_organizations"]:
+    if args["load_entities"]:
+        entities = read_entities(args["load_entities"])
+        github_scraper = GithubScraper(session_list, entities=entities)
+    elif args["load_organizations"]:
         organizations = read_organizations(args["load_organizations"])
         github_scraper = GithubScraper(session_list, organizations=organizations)
     elif args["load_repositories"]:
@@ -821,6 +862,7 @@ async def main() -> None:
     else:
         # Check args provided, get members/repos if necessary, call related methods
         called_args = [arg for arg, value in args.items() if value]
+
         if any(arg for arg in called_args if arg in require_members):
             github_scraper.members = await github_scraper.members()
         if any(arg for arg in called_args if arg in require_repos) and not github_scraper.repos:
