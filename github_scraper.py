@@ -7,15 +7,26 @@ import json
 import sys
 import time
 from pathlib import Path
+from collections import defaultdict
 from typing import Any, Dict, List, Tuple
 
 import aiohttp
 import networkx as nx
+import os
+import time
 
 # TODO: Instead of DiGraph, use MultiDiGraph everywhere?
 
 
-
+past_dir = "/Users/antonsquared/Google_Drive/PLSC_355/github-scraper/data/2023-04-24_00-42-58"
+finished_file_list = os.listdir(past_dir)
+finished_repo_set = set()
+for file in finished_file_list:
+    file_tokens = file.split("_")
+    org = file_tokens[0]
+    repo = file_tokens[1]
+    finished_repo_set.add((org, repo))
+print(finished_repo_set)
 
 class GithubScraper:
     """Scrape information about organizational Github accounts.
@@ -30,18 +41,27 @@ class GithubScraper:
         orgs (List[str]): List of organizational Github accounts to scrape
         session (aiohttp.ClientSession): Session using Github user name and API token
     """
-
+    def get_repo_data(repo_entry):
+        print(repo_entry)
+        if "owner" in repo_entry:
+            return repo_entry['owner']['login'], repo_entry['name']
+        else:
+            return repo_entry['organization'], repo_entry['name']
+        
     def __init__(
         self,  
-        github_session: aiohttp.ClientSession,
+        session_list: List[aiohttp.ClientSession],
         entities: List[str] = None,
         organizations: List[str] = None,
         repos: List[str] = None,
         members: List[str] = None,
     ) -> None:
         """Instantiate object."""
-        self.github_session = github_session
+        # TODO: implement a check to ensure sessions are still valid
+        self.session_list = session_list
+        self.num_valid_session = len(session_list)
         self.orgs = organizations
+        self.counter = 0
         self.repos = repos # this is asymmetrical! 
         # # map entities to orgs
         # self.entities = {entity:None for entity in entities}
@@ -53,13 +73,21 @@ class GithubScraper:
         # and only loaded if user selects operation that needs this list.
         # Saves API calls.
         self.members: Dict[str, List[str]] = {}
-        self.repo_list: List[Dict[str, Any]] = []
         # Directory to store scraped data with timestamp
         self.data_directory: Path = Path(
             Path.cwd(), "data", time.strftime("%Y-%m-%d_%H-%M-%S")
         )
         Path(self.data_directory).mkdir()
+    
 
+    async def wait_until_next_hour(self):
+        now = time.localtime().ts_min
+        await asyncio.wait((60 - now) * 60)
+
+    def get_session(self) -> aiohttp.ClientSession:
+        self.counter += 1
+        return self.session_list[self.counter % self.num_valid_session]
+    
     async def scrape_members(self) -> Dict[str, List[str]]:
         """Get list of members of specified orgs.
 
@@ -124,10 +152,12 @@ class GithubScraper:
             List[Dict[str, Any]]: Github URL loaded as JSON
         """
         page: int = 1
+        print(f"requesting: {url}")
         json_data: List[Dict[str, Any]] = []
         # Requesting user info doesn't support pagination and returns dict, not list
+        session = self.get_session()
         if url.split("/")[-2] == "users" or url.split("/")[-3] == "repos":
-            async with self.github_session.get(f"{url}?per_page=100") as resp:
+            async with session.get(f"{url}?per_page=100") as resp:
                 member_json: Dict[str, Any] = await resp.json()
                 # if "documentation_url" in member_json:
                 #     sys.exit(member_json['message'])
@@ -137,16 +167,26 @@ class GithubScraper:
             return json_data
         # Other API calls return lists and should paginate
         while True:
-            async with self.github_session.get(f"{url}?per_page=100&page={str(page)}") as resp:
+            print(f"requesting: {url}?per_page=100&page={str(page)}")
+
+            async with session.get(f"{url}?per_page=100&page={str(page)}") as resp:
                 json_page: List[Dict[str, Any]] = await resp.json()
                 if json_page == []:
                     break
                 #  if secondary-rate limited
                 if isinstance(json_page, dict) and "documentation_url" in json_page and "message" in json_page:
                     if "rate limit exceeded" in json_page["message"]:
-                        await asyncio.sleep(60 * 60)
+                        print(f"rate limit exceeded, waiting unti l next hour on': {url}?per_page=100&page={str(page)}")
+                        # TODO: this may cause deadlocks...should reason through it?
+                        self.wait_until_next_hour()
                     elif "secondary rate" in json_page["message"]:
+                        print(f"secondary rate limit exceeded, waiting 2 minutes on': {url}?per_page=100&page={str(page)}")
                         await asyncio.sleep(60 * 2)
+                    elif "empty" in json_page["message"]:
+                        print(f"{url}?per_page=100&page={str(page)} is empty")
+                        break
+                    else:
+                        print(f"{url}?per_page=100&page={str(page)} returned an error: {json_page['message']}")
                     continue
                 # if not isinstance(json_page, list):
                 #     raise Exception(f"query: {url}?per_page=100&page={str(page)} returned {(type(json_page))}")
@@ -163,8 +203,10 @@ class GithubScraper:
                         parsed_json_page.append(field_parser(item))
                     else:
                         parsed_json_page.append(item)
-
+                
                 json_data.extend(parsed_json_page)
+                if len(parsed_json_page) < 100:
+                    break
                 page += 1
         if callable(callback):
             callback(added_fields, json_data)
@@ -216,10 +258,10 @@ class GithubScraper:
         
 
     async def init_repos(self):
-        if self.repos:
-            return await self.scrape_repos()
-        else:
+        if not self.repos:
             return await self.scrape_org_repos()
+        else:
+            return await self.scrape_repos()
 
     async def create_org_repo_csv(self) -> None:
         """Write a CSV file with information about orgs' repositories."""
@@ -236,7 +278,7 @@ class GithubScraper:
             "fork",
             "description",
         ]
-        self.generate_csv("org_repositories.csv", self.repo_list, table_columns)
+        self.generate_csv("org_repositories.csv", self.repos, table_columns)
 
     async def scrape_repo_commit_history(self) -> None:
         """Create list of commits to the organizations' repositories."""
@@ -268,12 +310,16 @@ class GithubScraper:
             self.generate_csv(f"{metadata['organization']}_{metadata['repository']}_commit_history.csv", json_data, table_columns)
 
         
-        for repo in self.repo_list:
-            url = f"https://api.github.com/repos/{repo['owner']['login']}/{repo['name']}/commits"
+        for repo in self.repos:
+            org_name, repo_name = GithubScraper.get_repo_data(repo)
+            if (org_name, repo_name) in finished_repo_set:
+                print("skpping: ", org_name, repo_name, "already scraped")
+                continue
+            url = f"https://api.github.com/repos/{org_name}/{repo_name}/commits"
             tasks.append(
                 asyncio.create_task(
                     self.call_api(url, field_parser=repo_commit_history_field_parser, callback=save_commit_callback,
-                                    organization=repo['owner']['login'], repository=repo["name"])
+                                    organization=org_name, repository=repo_name)
                 )
             )
         json_commits_all = await self.load_json(tasks)
@@ -294,11 +340,12 @@ class GithubScraper:
             "url",
         ]
         tasks: List[asyncio.Task[Any]] = []
-        for repo in self.repo_list:
-            url = f"https://api.github.com/repos/{repo['owner']['login']}/{repo['name']}/contributors"
+        for repo in self.repos:
+            org_name, repo_name = GithubScraper.get_repo_data(repo)
+            url = f"https://api.github.com/repos/{org_name}/{repo_name}/contributors"
             tasks.append(
                 asyncio.create_task(
-                    self.call_api(url, organization={repo['owner']['login']}, repository=repo["name"])
+                    self.call_api(url, organization={org_name}, repository=repo_name)
                 )
             )
         json_contributors_all = await self.load_json(tasks)
@@ -521,7 +568,7 @@ class GithubScraper:
         print(f"Scraping organizations that contain entity name: {entity}")
         table_columns: List[str] = [
             "entity",
-            "organization",
+            "github_org_name",
             "id",
             "html_url",
         ]
@@ -545,7 +592,7 @@ class GithubScraper:
         self.generate_csv(f"{entity}_organizations.csv", json_orgs, table_columns)
 
 
-def read_config() -> Tuple[str, str]:
+def read_config() -> List[Tuple[str, str]]:
     """Read config file.
 
     Returns:
@@ -556,13 +603,17 @@ def read_config() -> Tuple[str, str]:
     """
     try:
         with open(Path(Path.cwd(), "config.json"), "r", encoding="utf-8") as file:
+            auth_list = []
             config = json.load(file)
-            user: str = config["user_name"]
-            api_token: str = config["api_token"]
-            if user == "" or api_token == "":
-                raise KeyError
-            else:
-                return user, api_token
+            if isinstance(config, list):
+                for elem in config:
+                    user: str = elem["user_name"]
+                    api_token: str = elem["api_token"]
+                    if user == "" or api_token == "":
+                        raise KeyError
+                    else:
+                        auth_list.append((user, api_token))
+            return auth_list
     except (FileNotFoundError, KeyError):
         sys.exit(
             "Failed to read Github user name and/or API token. "
@@ -593,13 +644,29 @@ def read_organizations(filename: str = None) -> List[str]:
 
 # #  TODO: generalize the caching layer to work with any API call
 def read_repos(filename: str = None) -> List[str]:
-    repos: List[Tuple[str,str]] = []
+    repos: List[Dict[str, any]] = []
     if not filename:
         filename = "repos.csv"
     with open(Path(Path.cwd(), filename), "r", encoding="utf-8") as file:
         reader = csv.DictReader(file)
+        table_columns: List[str] = [
+            "organization",
+            "name",
+            "full_name",
+            "stargazers_count",
+            "language",
+            "created_at",
+            "updated_at",
+            "homepage",
+            "fork",
+            "description",
+        ]
         for row in reader:
-            repos.append((row["organization"], row["name"]))
+            row_dict = {}
+            for col in table_columns:
+                if col in row:
+                    row_dict[col] = row[col]
+            repos.append(row_dict)
     if not repos:
         sys.exit(
             "No organizations to scrape found in organizations.csv. "
@@ -715,7 +782,7 @@ async def main() -> None:
             "You need to provide at least one argument. "
             "For usage, call: github_scraper -h"
         )
-    user, api_token = read_config()
+    auth_list = read_config()
 
     
     # To avoid unnecessary API calls, only get org members and repos if needed
@@ -728,37 +795,41 @@ async def main() -> None:
     ]
     require_repos = ["create_org_repo_csv", "scrape_repo_contributors", "scrape_repo_commit_history"]
     # Start aiohttp session
-    auth = aiohttp.BasicAuth(user, api_token)
+    session_list = []
+    for creds in auth_list:
+        # safety check on username, token done earlier
+        auth = aiohttp.BasicAuth(creds[0], creds[1])
+        session_list.append(aiohttp.ClientSession(auth=auth))
     print(args)
-    async with aiohttp.ClientSession(auth=auth) as github_session:
-        if args["load_organizations"]:
-            organizations = read_organizations(args["load_organizations"])
-            github_scraper = GithubScraper(github_session, organizations=organizations)
-        elif args["load_repositories"]:
-            repos = read_repos(args["load_repositories"])
-            github_scraper = GithubScraper(github_session, repos=repos)
-        else:
-            # no file loaded
-            raise Exception("No query file loaded.")
-        # If --all was provided, simply run everything
-        if args["all"]:
-            github_scraper.members = await github_scraper.scrape_members()
+
+    if args["load_organizations"]:
+        organizations = read_organizations(args["load_organizations"])
+        github_scraper = GithubScraper(session_list, organizations=organizations)
+    elif args["load_repositories"]:
+        repos = read_repos(args["load_repositories"])
+        print(repos)
+        github_scraper = GithubScraper(session_list, repos=repos)
+    else:
+        github_scraper = GithubScraper(session_list)
+    # If --all was provided, simply run everything
+    if args["all"]:
+        github_scraper.members = await github_scraper.scrape_members()
+        github_scraper.repos = await github_scraper.init_repos()
+        for arg in args:
+            if arg != "all" and arg != "find_organizations_for_entity":
+                await getattr(github_scraper, arg)()
+    else:
+        # Check args provided, get members/repos if necessary, call related methods
+        called_args = [arg for arg, value in args.items() if value]
+        if any(arg for arg in called_args if arg in require_members):
+            github_scraper.members = await github_scraper.members()
+        if any(arg for arg in called_args if arg in require_repos) and not github_scraper.repos:
             github_scraper.repos = await github_scraper.init_repos()
-            for arg in args:
-                if arg != "all" and arg != "find_organizations_for_entity":
-                    await getattr(github_scraper, arg)()
-        else:
-            # Check args provided, get members/repos if necessary, call related methods
-            called_args = [arg for arg, value in args.items() if value]
-            if any(arg for arg in called_args if arg in require_members):
-                github_scraper.members = await github_scraper.members()
-            if any(arg for arg in called_args if arg in require_repos):
-                github_scraper.repo_list = await github_scraper.init_repos()
-            for arg in called_args:
-                if args[arg] is True and hasattr(github_scraper, arg): # boolean, meaning no argument
-                    await getattr(github_scraper, arg)()
-                elif args[arg] and  hasattr(github_scraper, arg): # truthy, meaning there's an argument
-                     await getattr(github_scraper, arg)(args[arg])
+        for arg in called_args:
+            if args[arg] is True and hasattr(github_scraper, arg): # boolean, meaning no argument
+                await getattr(github_scraper, arg)()
+            elif args[arg] and  hasattr(github_scraper, arg): # truthy, meaning there's an argument
+                    await getattr(github_scraper, arg)(args[arg])
 
 
 if __name__ == "__main__":
