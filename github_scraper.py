@@ -17,17 +17,26 @@ import time
 
 # TODO: Instead of DiGraph, use MultiDiGraph everywhere?
 
+import sqlite3
 
-past_dir = "/Users/antonsquared/Google_Drive/PLSC_355/github-scraper/data/2023-04-24_04-11-31"
-finished_file_list = os.listdir(past_dir)
+
+
+data_root = "/Users/antonsquared/Google_Drive/PLSC_355/github-scraper/data"
+
+
 finished_repo_set = set()
-for file in finished_file_list:
-    file_tokens = file.split("_")
-    org = file_tokens[0]
-    repo = file_tokens[1]
-    finished_repo_set.add((org, repo))
-print(finished_repo_set)
-print(len(finished_repo_set))
+
+# mechanism for avoiding repeated work
+# past_dir = "/Users/antonsquared/Google_Drive/PLSC_355/github-scraper/data/2023-04-24_04-11-31"
+# finished_file_list = os.listdir(past_dir)
+# for file in finished_file_list:
+#     file_tokens = file.split("_")
+#     org = file_tokens[0]
+#     repo = file_tokens[1]
+#     finished_repo_set.add((org, repo))
+# print(finished_repo_set)
+# print(len(finished_repo_set))
+
 
 class GithubScraper:
     """Scrape information about organizational Github accounts.
@@ -43,14 +52,13 @@ class GithubScraper:
         session (aiohttp.ClientSession): Session using Github user name and API token
     """
     def get_repo_data(repo_entry):
-        print(repo_entry)
         if "owner" in repo_entry:
             return repo_entry['owner']['login'], repo_entry['name']
         else:
             return repo_entry['organization'], repo_entry['name']
-        
+
     def __init__(
-        self,  
+        self,
         session_list: List[aiohttp.ClientSession],
         entities: List[str] = None,
         organizations: List[str] = [],
@@ -64,7 +72,9 @@ class GithubScraper:
         self.orgs = organizations
         self.counter = 0
         self.entities = entities
-        self.repos = repos # this is asymmetrical! 
+        self.repos = repos  # this is asymmetrical!
+        self.conn = sqlite3.connect(os.path.join(
+            data_root, "github_scraper_db.sqlite3"))
         # # map entities to orgs
         # self.entities = {entity:None for entity in entities}
         # # map orgs to repos
@@ -80,7 +90,6 @@ class GithubScraper:
             Path.cwd(), "data", time.strftime("%Y-%m-%d_%H-%M-%S")
         )
         Path(self.data_directory).mkdir()
-    
 
     async def wait_until_next_hour(self):
         now = time.localtime().ts_min
@@ -89,7 +98,7 @@ class GithubScraper:
     def get_session(self) -> aiohttp.ClientSession:
         self.counter += 1
         return self.session_list[self.counter % self.num_valid_session]
-    
+
     async def scrape_members(self) -> Dict[str, List[str]]:
         """Get list of members of specified orgs.
 
@@ -168,7 +177,7 @@ class GithubScraper:
                 json_data.append(member_json)
             return json_data
         # Other API calls return lists and should paginate
-        while True:
+        while page < 100:
             print(f"requesting: {url}?per_page=100&page={str(page)}")
 
             async with session.get(f"{url}?per_page=100&page={str(page)}") as resp:
@@ -178,17 +187,20 @@ class GithubScraper:
                 #  if secondary-rate limited
                 if isinstance(json_page, dict) and "documentation_url" in json_page and "message" in json_page:
                     if "rate limit exceeded" in json_page["message"]:
-                        print(f"rate limit exceeded, waiting unti l next hour on': {url}?per_page=100&page={str(page)}")
+                        print(
+                            f"rate limit exceeded, waiting unti l next hour on': {url}?per_page=100&page={str(page)}")
                         # TODO: this may cause deadlocks...should reason through it?
                         self.wait_until_next_hour()
                     elif "secondary rate" in json_page["message"]:
-                        print(f"secondary rate limit exceeded, waiting 2 minutes on': {url}?per_page=100&page={str(page)}")
+                        print(
+                            f"secondary rate limit exceeded, waiting 2 minutes on': {url}?per_page=100&page={str(page)}")
                         await asyncio.sleep(60 * 2)
                     elif "empty" in json_page["message"]:
                         print(f"{url}?per_page=100&page={str(page)} is empty")
                         break
                     else:
-                        print(f"{url}?per_page=100&page={str(page)} returned an error: {json_page['message']}")
+                        print(
+                            f"{url}?per_page=100&page={str(page)} returned an error: {json_page['message']}")
                     continue
                 # if not isinstance(json_page, list):
                 #     raise Exception(f"query: {url}?per_page=100&page={str(page)} returned {(type(json_page))}")
@@ -205,7 +217,7 @@ class GithubScraper:
                         parsed_json_page.append(field_parser(item))
                     else:
                         parsed_json_page.append(item)
-                
+
                 json_data.extend(parsed_json_page)
                 if len(parsed_json_page) < 100:
                     break
@@ -234,7 +246,6 @@ class GithubScraper:
                 csv_file.writerow(item)
         print(f"- file saved as {Path('data', self.data_directory.name, file_name)}")
 
-
     async def find_organizations_for_entity(self, entity=None):
         """Find the organizations that a user or repository belongs to.
 
@@ -249,6 +260,13 @@ class GithubScraper:
         """
         if entity is None:
             return []
+        # check if entity is in the db
+
+        entity_id = self.conn.cursor().execute(
+            f"SELECT id FROM entity WHERE name = ?", (entity,)).fetchone()
+        if entity_id:
+            return self.conn.cursor().execute(f"SELECT name FROM org WHERE entity_id= ?", (entity_id[0],)).fetchall()
+
         tasks = []
         query_url = f"https://api.github.com/search/users?&q={entity}+in%3Aname+type%3Aorg&type=User"
         print(f"Scraping organizations that contain entity name: {entity}")
@@ -261,15 +279,15 @@ class GithubScraper:
 
         def entity_organizations_resp_parser(json_page):
             return json_page["items"]
-        
+
         def entity_organizations_field_parser(response):
             response["github_org_name"] = response["login"]
             return response
         # async with self.session.get(query_url) as response:
         tasks.append(asyncio.create_task(self.call_api(
-            query_url, 
-            resp_parser = entity_organizations_resp_parser, 
-            field_parser = entity_organizations_field_parser,
+            query_url,
+            resp_parser=entity_organizations_resp_parser,
+            field_parser=entity_organizations_field_parser,
             entity=entity)))
         #  probably need a new pipeline for this
 
@@ -278,6 +296,20 @@ class GithubScraper:
         self.generate_csv(f"{entity}_organizations.csv", json_orgs, table_columns)
         return json_orgs
 
+    async def scrape_entity_orgs(self) -> List[str]:
+        for entity in self.entities:
+            entity_org_list = await self.find_organizations_for_entity(entity)
+
+            def org_name_parser(org):
+                if "github_org_name" in org:
+                    return org["github_org_name"]
+                elif "name" in org:
+                    return org["name"]
+                else:
+                    raise Exception(f"org name not found for {org}")
+            org_names = {org_name_parser(org) for org in entity_org_list}
+            self.orgs.extend(org_names)
+        # TODO: implement saving this!
 
     async def scrape_org_repos(self) -> List[Dict[str, Any]]:
         """Create list of the organizations' repositories."""
@@ -285,12 +317,11 @@ class GithubScraper:
         tasks: List[asyncio.Task[Any]] = []
         if self.orgs:
             for org in self.orgs:
-                url = f"https://api.github.com/orgs/{org}/repos"
                 tasks.append(asyncio.create_task(self.call_api(url, organization=org)))
             return await self.load_json(tasks)
         else:
             raise ValueError("No organizations to scrape")
-        
+
     async def scrape_repos(self) -> List[Dict[str, Any]]:
         """Create rich repo objects from a tuple list of repos"""
         print("Completing Repository data")
@@ -298,16 +329,11 @@ class GithubScraper:
         if self.repos:
             for org, repo in self.repos:
                 url = f"https://api.github.com/repos/{org}/{repo}"
-                tasks.append(asyncio.create_task(self.call_api(url, organization=org, repository=repo)))
+                tasks.append(asyncio.create_task(self.call_api(
+                    url, organization=org, repository=repo)))
             return await self.load_json(tasks)
         else:
             raise ValueError("No repositories to scrape")
-        
-    async def scrape_entity_orgs(self) -> List[str]:
-        for entity in self.entities:
-            entity_org_list = await self.find_organizations_for_entity(entity)
-            org_names = {org["github_org_name"] for org in entity_org_list}
-            self.orgs.extend(org_names)
 
     async def init_repos(self):
         if not self.repos:
@@ -363,21 +389,24 @@ class GithubScraper:
         tasks: List[asyncio.Task[Any]] = []
 
         def save_commit_callback(metadata, json_data: List[Dict[str, Any]]) -> None:
-            self.generate_csv(f"{metadata['organization']}_{metadata['repository']}_commit_history.csv", json_data, table_columns)
+            self.generate_csv(
+                f"{metadata['organization']}_{metadata['repository']}_commit_history.csv", json_data, table_columns)
 
-        
         for repo in self.repos:
             org_name, repo_name = GithubScraper.get_repo_data(repo)
-            if (org_name, repo_name) in finished_repo_set:
-                print("skpping: ", org_name, repo_name, "already scraped")
-                continue
-            url = f"https://api.github.com/repos/{org_name}/{repo_name}/commits"
-            tasks.append(
-                asyncio.create_task(
-                    self.call_api(url, field_parser=repo_commit_history_field_parser, callback=save_commit_callback,
-                                    organization=org_name, repository=repo_name)
-                )
-            )
+            # check existing repo
+            query = f"SELECT 1 FROM repo WHERE name = ?"
+            if not self.conn.cursor().execute(query, (repo_name,)).fetchone():
+                if "fork" in repo and repo["fork"] == False:
+                    url = f"https://api.github.com/repos/{org_name}/{repo_name}/commits"
+                    tasks.append(
+                        asyncio.create_task(
+                            self.call_api(url, field_parser=repo_commit_history_field_parser, callback=save_commit_callback,
+                                          organization=org_name, repository=repo_name)
+                        )
+                    )
+            else:
+                print("skipping: ", org_name, repo_name, "already scraped")
         json_commits_all = await self.load_json(tasks)
         # every repo generats it's own commit history file. Ideal solution is to use a db
         # self.generate_csv("commit_history.csv", json_commits_all, table_columns)
@@ -634,6 +663,7 @@ def read_config() -> List[Tuple[str, str]]:
             "Please add them to the config.json file."
         )
 
+
 def read_entities(filename: str = None) -> List[str]:
     """Read list of organizations from file.
 
@@ -654,6 +684,7 @@ def read_entities(filename: str = None) -> List[str]:
             "in the column 'github_org_name' (one name per row)."
         )
     return orgs
+
 
 def read_organizations(filename: str = None) -> List[str]:
     """Read list of organizations from file.
@@ -677,6 +708,8 @@ def read_organizations(filename: str = None) -> List[str]:
     return orgs
 
 # #  TODO: generalize the caching layer to work with any API call
+
+
 def read_repos(filename: str = None) -> List[str]:
     repos: List[Dict[str, any]] = []
     if not filename:
@@ -710,7 +743,7 @@ def read_repos(filename: str = None) -> List[str]:
     print(repos)
     print("REPOS FINISHED")
     return repos
-    
+
 
 def parse_args() -> Dict[str, bool]:
     """Parse arguments.
@@ -726,17 +759,17 @@ def parse_args() -> Dict[str, bool]:
     )
     argparser.add_argument(
         "--load-entities",
-        "-le", 
+        "-le",
         help=" CSV File containing list of entities to scrape."
     )
     argparser.add_argument(
         "--load-organizations",
         "-lo",
-        help = "CSV File containing list of organizations to scrape."
+        help="CSV File containing list of organizations to scrape."
     )
     argparser.add_argument(
         "--load-repositories",
-        "-lr", 
+        "-lr",
         help=" CSV File containing list of repositories to scrape."
     )
     argparser.add_argument(
@@ -823,7 +856,6 @@ async def main() -> None:
         )
     auth_list = read_config()
 
-    
     # To avoid unnecessary API calls, only get org members and repos if needed
     require_members = [
         "scrape_members_repos",
@@ -832,7 +864,8 @@ async def main() -> None:
         "generate_follower_network",
         "generate_memberships_network",
     ]
-    require_repos = ["create_org_repo_csv", "scrape_repo_contributors", "scrape_repo_commit_history"]
+    require_repos = ["create_org_repo_csv",
+                     "scrape_repo_contributors", "scrape_repo_commit_history"]
     # Start aiohttp session
     session_list = []
     for creds in auth_list:
@@ -868,10 +901,12 @@ async def main() -> None:
         if any(arg for arg in called_args if arg in require_repos) and not github_scraper.repos:
             github_scraper.repos = await github_scraper.init_repos()
         for arg in called_args:
-            if args[arg] is True and hasattr(github_scraper, arg): # boolean, meaning no argument
+            # boolean, meaning no argument
+            if args[arg] is True and hasattr(github_scraper, arg):
                 await getattr(github_scraper, arg)()
-            elif args[arg] and  hasattr(github_scraper, arg): # truthy, meaning there's an argument
-                    await getattr(github_scraper, arg)(args[arg])
+            # truthy, meaning there's an argument
+            elif args[arg] and hasattr(github_scraper, arg):
+                await getattr(github_scraper, arg)(args[arg])
 
 
 if __name__ == "__main__":
