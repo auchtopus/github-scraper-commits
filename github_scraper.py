@@ -20,8 +20,7 @@ import time
 import sqlite3
 
 
-
-data_root = "/Users/antonsquared/Google_Drive/PLSC_355/github-scraper/data"
+data_root = "/Users/antonsquared/Projects/github-scraper/data"
 
 
 finished_repo_set = set()
@@ -292,7 +291,7 @@ class GithubScraper:
         #  probably need a new pipeline for this
 
         json_orgs = await self.load_json(tasks)
-        print(json_orgs)
+        # print(json_orgs)
         self.generate_csv(f"{entity}_organizations.csv", json_orgs, table_columns)
         return json_orgs
 
@@ -317,6 +316,7 @@ class GithubScraper:
         tasks: List[asyncio.Task[Any]] = []
         if self.orgs:
             for org in self.orgs:
+                url = f"https://api.github.com/orgs/{org}/repos"
                 tasks.append(asyncio.create_task(self.call_api(url, organization=org)))
             return await self.load_json(tasks)
         else:
@@ -395,9 +395,9 @@ class GithubScraper:
         for repo in self.repos:
             org_name, repo_name = GithubScraper.get_repo_data(repo)
             # check existing repo
-            query = f"SELECT 1 FROM repo WHERE name = ?"
-            if not self.conn.cursor().execute(query, (repo_name,)).fetchone():
-                if "fork" in repo and repo["fork"] == False:
+            query = f"SELECT id FROM repo WHERE name = ?"
+            if not self.conn.cursor().execute(query, (repo_name.upper().strip(),)).fetchone():
+                if ("fork" not in repo) or ("fork" in repo and repo["fork"] == False):
                     url = f"https://api.github.com/repos/{org_name}/{repo_name}/commits"
                     tasks.append(
                         asyncio.create_task(
@@ -686,7 +686,7 @@ def read_entities(filename: str = None) -> List[str]:
     return orgs
 
 
-def read_organizations(filename: str = None) -> List[str]:
+def read_organizations(self, filename: str = None) -> List[str]:
     """Read list of organizations from file.
 
     Returns:
@@ -699,6 +699,10 @@ def read_organizations(filename: str = None) -> List[str]:
         reader = csv.DictReader(file)
         for row in reader:
             orgs.append(row["github_org_name"])
+            # # add entity-org bindings to the db
+            # self.conn.cursor().execute("INSERT OR IGNORE INTO entity (name) VALUES (?)", (row["entity_name"]))
+            # self.conn.cursor().execute("SELECT id FROM entity WHERE name=?", (row["entity_name"],))
+            # self.conn.cursor().execute("INSERT OR IGNORE INTO org (name, ")
     if not orgs:
         sys.exit(
             "No organizations to scrape found in organizations.csv. "

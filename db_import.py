@@ -60,8 +60,8 @@ def setup_db(conn):
                 id INTEGER PRIMARY KEY,
                 name TEXT NOT NULL UNIQUE,
                 org_id INTEGER NOT NULL,
-                created_at TIMESTAMP NOT NULL,
-                fork BOOLEAN NOT NULL,
+                created_at TIMESTAMP,
+                fork BOOLEAN,
                 FOREIGN KEY (org_id) REFERENCES org(id)
             )
         """)
