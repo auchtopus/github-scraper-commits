@@ -1,0 +1,34 @@
+PRAGMA foreign_keys = ON;
+CREATE TABLE IF NOT EXISTS entity (
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE
+);
+CREATE TABLE IF NOT EXISTS org (
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE,
+    org_url TEXT NOT NULL,
+    entity_id INTEGER NOT NULL,
+    FOREIGN KEY (entity_id) REFERENCES entity(id)
+);
+CREATE TABLE IF NOT EXISTS user (
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE,
+    email TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS repo (
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE,
+    org_id INTEGER NOT NULL,
+    created_at TIMESTAMP NOT NULL,
+    fork BOOLEAN NOT NULL,
+    FOREIGN KEY (org_id) REFERENCES org(id)
+);
+CREATE TABLE IF NOT EXISTS git_commit (
+    id INTEGER PRIMARY KEY,
+    hash TEXT NOT NULL UNIQUE,
+    author_id INTEGER NOT NULL,
+    repo_id INTEGER NOT NULL,
+    committed_at TIMESTAMP NOT NULL,
+    FOREIGN KEY (author_id) REFERENCES user(id),
+    FOREIGN KEY (repo_id) REFERENCES repo(id)
+);
